@@ -15,7 +15,7 @@ import argparse
 import re
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -50,20 +50,29 @@ class Redactor(ABC):
 
 
 class CertificateRedactor(Redactor):
-    """Redacts PEM certificate bodies while preserving BEGIN/END markers."""
+    """Redacts PEM certificate and private key bodies while preserving BEGIN/END markers."""
+
+    PEM_PATTERN = re.compile(
+        r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?(?:PRIVATE KEY|CERTIFICATE)-----'
+        r'.*?'
+        r'-----END (?:RSA |EC |DSA |OPENSSH )?(?:PRIVATE KEY|CERTIFICATE)-----',
+        re.DOTALL,
+    )
 
     @property
     def name(self) -> str:
-        return "Certificates"
+        return "Certificates/Keys"
 
     def redact(self, content: str) -> RedactionResult:
         if not content:
             return RedactionResult(content=content or "")
 
-        cert_pattern = r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----'
-        replacement = '-----BEGIN CERTIFICATE-----\n[REDACTED]\n-----END CERTIFICATE-----'
+        def _replace_pem(m):
+            header = m.group(0).split('\n', 1)[0]
+            trailer = m.group(0).rsplit('\n', 1)[-1]
+            return f"{header}\n[REDACTED]\n{trailer}"
 
-        redacted, count = re.subn(cert_pattern, replacement, content, flags=re.DOTALL)
+        redacted, count = self.PEM_PATTERN.subn(_replace_pem, content)
         return RedactionResult(content=redacted, modified=count > 0, redaction_count=count)
 
 
@@ -77,17 +86,29 @@ class PasswordRedactor(Redactor):
         'SECRET_KEY',
         'API_KEY',
         'TOKEN',
+        'ENCRYPTION_KEY',
+        'JWT_KEY',
+        'DSN',
     ]
+
+    # Keys that can appear with arbitrary prefixes (e.g. GITHUB_TOKEN, DB_PASSWORD)
+    _PREFIXED_KEYS = frozenset((
+        'PASSWORD', 'SECRET', 'SECRET_KEY', 'API_KEY', 'TOKEN',
+        'ENCRYPTION_KEY', 'JWT_KEY', 'DSN',
+    ))
+
+    def __init__(self):
+        self._patterns = self._build_patterns()
 
     @property
     def name(self) -> str:
         return "Passwords/Secrets"
 
-    def _build_patterns(self) -> List[Tuple[str, str]]:
-        patterns = []
+    def _build_patterns(self) -> List[Tuple[re.Pattern, str]]:
+        patterns: List[Tuple[str, str]] = []
 
         for key in self.SENSITIVE_KEYS:
-            if key in ('PASSWORD', 'SECRET', 'SECRET_KEY', 'API_KEY', 'TOKEN'):
+            if key in self._PREFIXED_KEYS:
                 # Env var style with optional prefix: SOME_PASSWORD=value
                 patterns.append((
                     rf'([A-Z_]*{key}=)([^\s"\',\]]+)',
@@ -154,14 +175,20 @@ class PasswordRedactor(Redactor):
             r'\1[REDACTED]'
         ))
 
-        # High-entropy tokens: 64+ character alphanumeric strings without hyphens
+        # Connection strings: postgres://user:password@host, mysql://user:pass@host
+        patterns.append((
+            r'((?:postgres|postgresql|mysql|amqp|redis)://[^:]+:)([^@]+)(@)',
+            r'\1[REDACTED]\3'
+        ))
+
+        # High-entropy tokens: 128+ character alphanumeric strings without hyphens
         # (not sha256 digests, not Kubernetes resource names which use hyphens)
         patterns.append((
-            r'(?<![\w:])([A-Za-z0-9_/+=]{64,})(?![\w:])',
+            r'(?<![\w:])([A-Za-z0-9_/+=]{128,})(?![\w:])',
             r'[REDACTED_TOKEN]'
         ))
 
-        return patterns
+        return [(re.compile(p), r) for p, r in patterns]
 
     def redact(self, content: str) -> RedactionResult:
         if not content:
@@ -170,8 +197,8 @@ class PasswordRedactor(Redactor):
         redacted = content
         total = 0
 
-        for pattern, replacement in self._build_patterns():
-            redacted, count = re.subn(pattern, replacement, redacted)
+        for pattern, replacement in self._patterns:
+            redacted, count = pattern.subn(replacement, redacted)
             total += count
 
         return RedactionResult(content=redacted, modified=total > 0, redaction_count=total)
@@ -224,11 +251,20 @@ class IPRedactor(Redactor):
             redacted
         )
 
-        total = len(self._internal_map) + len(self._k8s_map)
+        # 192.168.x.x with optional CIDR
+        def replace_192(m):
+            return self._get_internal_placeholder(m.group(1)) + (m.group(2) or '')
+
+        redacted = re.sub(
+            r'\b(192\.168\.\d{1,3}\.\d{1,3})(/\d{1,2})?\b',
+            replace_192,
+            redacted
+        )
+
         return RedactionResult(
             content=redacted,
-            modified=total > 0 or redacted != content,
-            redaction_count=total
+            modified=redacted != content,
+            redaction_count=sum(1 for _ in re.finditer(r'REDACTED', redacted)) if redacted != content else 0
         )
 
 
@@ -240,6 +276,11 @@ class DomainRedactor(Redactor):
         r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.)+local\b',
         r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.)+corp\b',
         r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.)+private\b',
+    ]
+
+    # Patterns that should be excluded from redaction (K8s service DNS)
+    EXCLUDE_PATTERNS = [
+        re.compile(r'\.svc\.cluster\.local$', re.IGNORECASE),
     ]
 
     PROXY_PATTERNS = [
@@ -269,10 +310,16 @@ class DomainRedactor(Redactor):
         redacted = content
         proxy_count = 0
 
+        def _replace_domain(m):
+            domain = m.group(0)
+            if any(p.search(domain) for p in self.EXCLUDE_PATTERNS):
+                return domain
+            return self._get_domain_placeholder(domain)
+
         for pattern in self.DOMAIN_PATTERNS:
             redacted = re.sub(
                 pattern,
-                lambda m: self._get_domain_placeholder(m.group(0)),
+                _replace_domain,
                 redacted,
                 flags=re.IGNORECASE
             )
@@ -281,8 +328,11 @@ class DomainRedactor(Redactor):
             redacted, count = re.subn(pattern, replacement, redacted, flags=re.IGNORECASE)
             proxy_count += count
 
-        total = len(self._domain_map) + proxy_count
-        return RedactionResult(content=redacted, modified=total > 0, redaction_count=total)
+        return RedactionResult(
+            content=redacted,
+            modified=redacted != content,
+            redaction_count=len(self._domain_map) + proxy_count if redacted != content else 0
+        )
 
 
 class ConfigMapRedactor(Redactor):
@@ -309,51 +359,31 @@ class ConfigMapRedactor(Redactor):
         try:
             import yaml
         except ImportError:
+            print('WARNING: PyYAML not available, falling back to generic cert redaction',
+                  file=sys.stderr)
             return self._cert_redactor.redact(content)
 
+        # Check if this looks like a CA-related ConfigMap by inspecting names
+        # without doing a full parse/serialize round-trip (preserves comments/formatting)
         try:
             docs = list(yaml.safe_load_all(content))
         except Exception:
             return RedactionResult(content=content)
 
-        modified = False
-        redaction_count = 0
-
+        should_redact = False
         for doc in docs:
             if not doc or not isinstance(doc, dict) or doc.get('kind') != 'ConfigMap':
                 continue
-
             cm_name = doc.get('metadata', {}).get('name', '')
-            should_redact = any(re.match(p, cm_name) for p in self.REDACT_PATTERNS)
+            if any(re.match(p, cm_name) for p in self.REDACT_PATTERNS):
+                should_redact = True
+                break
 
-            if not should_redact:
-                continue
+        if not should_redact:
+            return RedactionResult(content=content)
 
-            if 'data' in doc:
-                for key, value in doc['data'].items():
-                    if isinstance(value, str) and 'BEGIN CERTIFICATE' in value:
-                        result = self._cert_redactor.redact(value)
-                        doc['data'][key] = result.content
-                        modified = True
-                        redaction_count += result.redaction_count
-
-            if 'binaryData' in doc:
-                for key in doc['binaryData']:
-                    doc['binaryData'][key] = '[REDACTED]'
-                    modified = True
-                    redaction_count += 1
-
-        if modified:
-            import io
-            stream = io.StringIO()
-            yaml.dump_all(docs, stream, default_flow_style=False, explicit_start=True)
-            return RedactionResult(
-                content=stream.getvalue(),
-                modified=True,
-                redaction_count=redaction_count,
-            )
-
-        return RedactionResult(content=content)
+        # Apply certificate redaction directly to the raw text (preserves comments/formatting)
+        return self._cert_redactor.redact(content)
 
 
 class RedactorChain:
@@ -385,12 +415,16 @@ def process_directory(directory: Path, verbose: bool = True) -> int:
     chain = RedactorChain(get_default_redactors())
     modified_total = 0
 
-    all_files = [f for f in directory.rglob('*') if f.is_file()]
+    all_files = [f for f in directory.rglob('*') if f.is_file() and not f.is_symlink()]
     print(f"Processing {len(all_files)} file(s) in {directory}...")
 
     for filepath in all_files:
         try:
-            content = filepath.read_text(encoding='utf-8', errors='replace')
+            content = filepath.read_text(encoding='utf-8', errors='strict')
+        except UnicodeDecodeError:
+            if verbose:
+                print(f"  SKIP (binary): {filepath.relative_to(directory)}")
+            continue
         except Exception as e:
             if verbose:
                 print(f"  SKIP (read error): {filepath.relative_to(directory)}: {e}")
@@ -399,7 +433,30 @@ def process_directory(directory: Path, verbose: bool = True) -> int:
         result = chain.redact(content)
 
         if result.modified:
-            filepath.write_text(result.content, encoding='utf-8')
+            try:
+                import tempfile
+                import os
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    dir=str(filepath.parent),
+                    prefix=f'.{filepath.name}.',
+                    suffix='.tmp',
+                )
+                closed = False
+                try:
+                    os.write(tmp_fd, result.content.encode('utf-8'))
+                    os.close(tmp_fd)
+                    closed = True
+                    os.rename(tmp_path, str(filepath))
+                except BaseException:
+                    if not closed:
+                        os.close(tmp_fd)
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                    raise
+            except Exception as e:
+                if verbose:
+                    print(f"  ERROR (write): {filepath.relative_to(directory)}: {e}")
+                continue
             modified_total += 1
             if verbose:
                 print(f"  REDACTED ({result.redaction_count} items): "
@@ -420,8 +477,8 @@ def main():
     parser.add_argument(
         '--redact-only',
         action='store_true',
-        default=True,
-        help="Run redaction only (default behaviour)"
+        default=False,
+        help="Run redaction on an existing must-gather directory without re-collecting"
     )
     parser.add_argument(
         '-q', '--quiet',
